@@ -8,12 +8,12 @@ End-to-end pipeline for JavaScript security analysis on Termux. Combines custom 
 
 ```
 PHASE 1: HARVEST     → Collect JS files from target
-PHASE 2: DECODE      → Deobfuscate, beautify, unpack webpack
-PHASE 3: DEEP SCAN   → 50+ security scanners + AST taint tracking
-PHASE 4: CROSS-FILE  → Correlate credentials across files
+PHASE 2: DECODE      → Deobfuscate, beautify, unpack webpack, auto-follow sourcemaps
+PHASE 3: DEEP SCAN   → 50+ security scanners + AST taint tracking + service worker + chunk graph
+PHASE 4: CROSS-FILE  → Correlate credentials across files (batch mode)
 PHASE 5: WEB3 SCAN   → Blockchain/Web3-specific patterns
-PHASE 6: REPORT      → SARIF, HTML, JSON, Markdown
-PHASE 7: VALIDATE    → Manual verification in browser/Burp
+PHASE 6: REPORT      → SARIF, HTML, JSON, Markdown, GitHub annotations
+PHASE 7: VALIDATE    → Manual verification in browser/Burp; --verify for live endpoint checks
 ```
 
 ---
@@ -226,108 +226,118 @@ node ~/tools/omega-unified.js ~/recon/$TARGET/js/bundle.js 2>&1 \
 
 ---
 
-## Gaps & Suggested Improvements
+## Gaps & Implemented Improvements
 
-### Gap 1: No directory/batch mode in omega-unified
+### Gap 1: Directory/batch mode (IMPLEMENTED)
 
-**Current:** Scans one file at a time. Running 50 JS files means running the command 50 times.
+**Status:** `--dir <path>` scans all `.js` files in a directory, producing a consolidated report with cross-file aggregation.
 
-**Suggested:**
 ```bash
-# --dir mode: process all .js files in a directory, produce one consolidated report
 node ~/tools/omega-unified.js --dir ~/recon/$TARGET/js/ -o consolidated-report.json
+node ~/tools/omega-unified.js --dir ./js/ --cache --format html -o batch.html
 ```
-- Aggregate findings across files (count how many files have `innerHTML` sinks)
-- Cross-file credential correlation (same key appears in 3 chunks)
-- Summary metrics (X files scanned, Y findings, top categories)
-- Chunk overlap detection (same route/endpoint in multiple chunks)
+- Aggregate findings across files
+- Cross-file credential correlation
+- Summary metrics (X files scanned, Y findings, cached count)
+- `--cache` flag prevents re-scanning unchanged files
 
-### Gap 2: No URL crawling in omega-unified
+### Gap 2: URL crawling (IMPLEMENTED)
 
-**Current:** Requires already-downloaded files. No `omega-unified --url https://target.com/bundle.js`.
+**Status:** `--url <url>` downloads and scans a remote JS file in one command.
 
-**Suggested:**
 ```bash
-# --url mode: download + scan in one command
 node ~/tools/omega-unified.js --url https://target.com/static/js/main.js
+node ~/tools/omega-unified.js --url https://target.com/bundle.js --verify -f github-annotation
 ```
-- `curl` + pipe to scanners
-- Follow sourcemap links automatically
-- Optional: `--crawl` to find additional JS from `<script src>` tags
+- Auto-follows redirects (max 1 hop)
+- 30s timeout per request
+- Sourcemap auto-follow works for inline base64 sourcemaps
 
-### Gap 3: No service worker analysis
+### Gap 3: Service worker analysis (IMPLEMENTED)
 
-**Current:** Neither omega-unified nor termscan have dedicated SW scanners.
+**Status:** Phase 12o added to main pipeline. Scans for SW registration, fetch intercept, message listeners (with/without origin validation), Cache API usage, `skipWaiting()`, and `clients.claim()`.
 
-**Suggested:** Add scanner for:
-```javascript
-// In omega-unified Phase 12b-n or new phase:
-// navigator.serviceWorker.register(url) — is the SW from a controllable path?
-// self.addEventListener('fetch', ...) — does SW intercept and modify requests?
-// self.addEventListener('message', ...) — does SW trust origin?
-// caches.open(...) — cache poisoning potential
-// skipWaiting / clients.claim — immediate takeover
-```
-See `[OK] service-worker-attacks` skill for full methodology.
-
-### Gap 4: No sourcemap auto-follow
-
-**Current:** Sourcemaps must be manually discovered and fetched.
-
-**Suggested:**
 ```bash
-# In decode pipeline (Phase 0):
-# If //# sourceMappingURL= found, auto-fetch and decode
-curl -s "https://target.com/bundle.js.map" | node ~/tools/omega-unified.js --sourcemap -
+# Runs automatically in non--fast mode
+node ~/tools/omega-unified.js --verbose bundle.js
+  # service-worker           5ms
 ```
-- Recover original source from .map files
-- Compare minified vs original findings delta
+- `sw-register-relative` (MEDIUM): relative SW URL → scope hijacking risk
+- `sw-fetch-intercept` (MEDIUM): SW intercepts all fetch requests
+- `sw-message-no-origin` (HIGH): postMessage listener without origin validation
+- `sw-cache-api` (INFO): Cache API usage
+- `sw-skip-waiting` / `sw-clients-claim` (INFO): immediate takeover
 
-### Gap 5: No batch resume/cache
+### Gap 4: Sourcemap auto-follow (IMPLEMENTED)
 
-**Current:** Re-running omega-unified on a large bundle re-does all work.
+**Status:** `decodePipeline()` auto-detects inline base64 `sourceMappingURL` comments and reverse-applies mappings via `lib/sourcemap.js`. Adjacent `.map` files are resolved when a file path is available.
 
-**Suggested:** Add SQLite cache (similar to termux-js-secret-scanner):
 ```bash
-node ~/tools/omega-unified.js --cache ~/omega-cache.db bundle.js
+# Inline sourcemaps auto-decoded — no extra flag needed
+# Adjacent .map files: place bundle.js.map next to bundle.js
+node ~/tools/omega-unified.js bundle.js
 ```
-- File hash → cached results
-- Only re-scan on hash change
-- Mandatory for directory batch mode
+- Recovers original variable/function names from minified code
+- Supports inline base64 and adjacent-file sourcemaps
+- Name replacement is applied to decoded code (structural analysis unaffected)
 
-### Gap 6: No chunk dependency graph
+### Gap 5: File-hash cache (IMPLEMENTED)
 
-**Current:** `lib/webpack-resolver.js` exists but is not wired into the main pipeline.
+**Status:** `--cache` flag enables MD5-based JSON file cache at `~/.cache/omega-unified/`.
 
-**Suggested:** In Phase 12, add:
 ```bash
-node ~/tools/omega-unified.js --chunk-graph ~/recon/$TARGET/js/ --entry main.js
+# First run — normal scan
+node ~/tools/omega-unified.js --cache bundle.js
+
+# Second run — "Cache hit — skipping" if file unchanged
+node ~/tools/omega-unified.js --cache bundle.js
+
+# Batch mode with cache
+node ~/tools/omega-unified.js --dir ./js/ --cache -f html -o batch.html
 ```
-- Parse Webpack runtime to find chunk IDs
-- Build import graph: `main.js` → `vendors~main.chunk.js` → `admin.chunk.js`
-- Flag "admin-only code in public chunk" issues
-- Cross-chunk taint tracking (if tainted data flows from main to a lazy chunk)
+- Zero external dependencies (core `crypto` + `fs` only)
+- Per-file cache keyed by absolute path (sanitized for filesystem)
+- Silent failure if cache dir unwritable — scanning continues
+- Cache miss triggers re-scan and automatic cache update
 
-### Gap 7: No CI/CD formatting flag
+### Gap 6: Chunk dependency graph (IMPLEMENTED)
 
-**Current:** SARIF output exists but no GitHub-native annotations.
+**Status:** `analyseChunkGraph()` (Phase 12p) wraps `lib/webpack-resolver.js`. Runs automatically in non-`--fast` mode.
 
-**Suggested:**
 ```bash
---format github-annotation
+# Runs automatically — chunk info in verbose phase output
+node ~/tools/omega-unified.js --verbose bundle.js
+  # chunk-graph             42ms
+
+# Findings generated for:
+#   chunk-hub (LOW): modules with >20 outgoing deps
+#   chunk-admin-module (MEDIUM): admin logic in webpack chunks
+#   chunk-hot-module (INFO): most-referenced modules
+#   chunk-format (INFO): detected webpack version + module count
 ```
-- Output `::warning file=bundle.js,line=42::XSS sink detected`
-- Direct CI integration without SARIF parser
+- Parses WP5 (`self["webpackChunk"].push`) and WP4 (`[[id],{...}]`) formats
+- Module name heuristics: source-level hints (`require`), legacy ID map, source patterns
+- No `--chunk-graph` flag needed — always-on in full scan
 
-### Gap 8: No live URL verification
+### Gap 7: GitHub Annotation format (IMPLEMENTED)
 
-**Current:** Scans static files. No way to verify findings against live endpoints.
+**Status:** `--format github-annotation` emits GitHub-native `::error`/`::warning`/`::notice` annotations.
 
-**Suggested:** Optional follow-up to Phase 7:
 ```bash
-# --verify: for each API endpoint found, try a test request
-node ~/tools/omega-unified.js --verify --auth "Bearer $TOKEN" bundle.js
+node ~/tools/omega-unified.js --format github-annotation bundle.js
 ```
-- Check if discovered endpoints are actually accessible
-- Check if discovered API keys are still valid
-- Rate-limit awareness (--delay 1000ms)
+- Severity map: CRITICAL/HIGH → `error`, MEDIUM/LOW → `warning`, INFO → `notice`
+- File paths localized per-finding (batch mode)
+- Direct CI integration — no SARIF parser needed
+
+### Gap 8: Live URL verification (IMPLEMENTED)
+
+**Status:** `--verify` flag performs HTTP(S) requests on discovered endpoints after scanning.
+
+```bash
+node ~/tools/omega-unified.js --verify bundle.js
+```
+- Concurrent verification (batch size 5, 5s timeout)
+- Skips non-HTTP URLs (ws://, wss://, etc.)
+- Reports reachable status codes
+- Works with `--cache`: cached results also get verified

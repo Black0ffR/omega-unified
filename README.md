@@ -25,11 +25,17 @@
 
 - **Zero npm dependencies** — runs on Node.js core only
 - **AST-based taint tracking** — traces untrusted data through 5+ variable hops
-- **Decode pipeline** — resolves Webpack wrappers, charCode/base64/hex obfuscation, Angular Ivy/Vue3/React/Svelte symbols, beautifies output
+- **Decode pipeline** — resolves Webpack wrappers, charCode/base64/hex obfuscation, Angular Ivy/Vue3/React/Svelte symbols, beautifies output, auto-follows inline sourcemaps
 - **50+ detection scanners** — XSS, prototype pollution, eval, crypto misuse, hardcoded secrets, WebSocket hijacking, command injection, IDOR, race conditions, Web3/blockchain
-- **Multiple output formats** — text, JSON, HTML, Markdown, SARIF
+- **Service worker analysis** — register URL, fetch intercept, message origin validation, cache API
+- **Webpack chunk graph** — module dependency resolution, hub detection, admin-chunk analysis
+- **Multiple output formats** — text, JSON, HTML, Markdown, SARIF, GitHub Annotations
 - **Suppression comments** — `// omega-ignore: rule-id` for false positives
 - **Attack surface scoring** — weighted CRITICAL/HIGH/MEDIUM/LOW risk levels
+- **Batch directory scanning** — `--dir` scans all .js files, consolidated report
+- **Remote URL scanning** — `--url` downloads + scans in one command
+- **File-hash cache** — `--cache` skips unchanged files (single + batch)
+- **Live endpoint verification** — `--verify` HTTP-checks discovered URLs
 
 ## Quick Start
 
@@ -42,25 +48,40 @@ cat > package.json << 'EOF'
 { "name": "omega-unified", "version": "5.0.0", "private": true, "main": "omega-unified.js" }
 EOF
 
-# Scan a file
+# Scan a single file
 node omega-unified.js bundle.js
+
+# Scan a remote file
+node omega-unified.js --url https://target.com/bundle.js
+
+# Scan directory
+node omega-unified.js --dir ./js-files/
 
 # Generate HTML report
 node omega-unified.js -f html -o report.html bundle.js
+
+# GitHub Actions integration
+node omega-unified.js --format github-annotation bundle.js
 ```
 
 ## CLI Usage
 
 ```
-node omega-unified.js [options] <file.js>
+node omega-unified.js [options] <file.js | --dir <path> | --url <url>>
 
 Options:
-  -f, --format <type>    Report format: text|json|html|md|sarif  (default: text)
+  -f, --format <type>    Report format: text|json|html|md|sarif|github-annotation (default: text)
   -o, --output <file>    Write report to file
   -q, --quiet            Suppress progress output
   -v, --verbose          Show phase timings and details
   --fast                 Skip extended scanners (reduces runtime ~2x)
+  --dir <path>           Batch scan all .js files in directory
+  --url <url>            Download and scan a remote JS file
+  --cache                Enable file-hash cache (skip unchanged files)
+  --verify               HTTP-verify discovered endpoints after scan
   --no-color             Disable ANSI colors
+  --no-frames            Disable framework detection
+  --no-routes            Disable route extraction
   --config <file>        Load config for suppression comments
   -h, --help             Show help
   --version              Show version
@@ -81,25 +102,35 @@ node omega-unified.js --fast bundle.js
 # CI/CD integration with SARIF
 node omega-unified.js -f sarif -o results.sarif bundle.js
 
+# Batch scan directory with cache
+node omega-unified.js --dir ./js-files/ --cache -f html -o batch-report.html
+
+# Remote URL + endpoint verification
+node omega-unified.js --url https://target.com/bundle.js --verify
+
+# GitHub Actions annotations
+node omega-unified.js --url https://target.com/bundle.js -f github-annotation
+
 # Verbose HTML report with phase timings
 node omega-unified.js -f html -o scan.html --verbose bundle.js
 ```
 
 ## Output Formats
 
-| Format  | Extension | Use Case              |
-|---------|-----------|-----------------------|
-| `text`  | stdout    | Terminal review       |
-| `json`  | `.json`   | Programmatic parsing  |
-| `html`  | `.html`   | Visual report         |
-| `md`    | `.md`     | GitHub/GitLab notes   |
-| `sarif` | `.sarif`  | CI/CD pipeline ingest |
+| Format               | Extension | Use Case              |
+|----------------------|-----------|-----------------------|
+| `text`               | stdout    | Terminal review       |
+| `json`               | `.json`   | Programmatic parsing  |
+| `html`               | `.html`   | Visual report         |
+| `md`                 | `.md`     | GitHub/GitLab notes   |
+| `sarif`              | `.sarif`  | CI/CD pipeline ingest |
+| `github-annotation`  | stdout    | GitHub Actions native |
 
 ## How It Works
 
-The scanner processes JS files through 15 phases:
+The scanner processes JS files through 18 phases:
 
-1. **Decode pipeline (Phases 0–7):** Resolves module aliases, unescapes strings, decodes charCode/base64/hex obfuscation, normalizes booleans, strips Webpack wrappers, annotates Angular Ivy / Vue3 / React / Svelte / Lodash / RxJS symbols, beautifies output
+1. **Decode pipeline (Phases 0–7):** Resolves module aliases, unescapes strings, decodes charCode/base64/hex obfuscation, normalizes booleans, strips Webpack wrappers, annotates Angular Ivy / Vue3 / React / Svelte / Lodash / RxJS symbols, auto-follows inline sourcemaps, beautifies output
 2. **Code analysis (Phase 8):** Counts functions/classes/components/services, measures cyclomatic complexity, identifies route guards, socket events
 3. **Storage audit (Phase 8b):** Catalogs localStorage/sessionStorage/cookie keys, flags sensitive names
 4. **Auth surface mapping (Phase 8c):** Finds protected vs unprotected endpoints
@@ -108,7 +139,9 @@ The scanner processes JS files through 15 phases:
 7. **Credential scanner (Phase 11):** 32 patterns — API keys, JWTs, AWS, Google OAuth, Stripe, tokens
 8. **Security analysis (Phase 12):** XSS sinks, eval/Funcion(), Angular `bypassSecurityTrust*`, command injection, broken crypto, JWT secrets, window.open
 9. **Extended scanners (Phases 12b–n, skip with `--fast`):** Dynamic code exec, business logic flaws, WebSocket XSS, crypto context, info leakage, IDOR, vulnerable dependencies, race conditions, **AST-based taint flow** (propagation through 5+ variable hops), Web3/blockchain, config-driven behavior, lazy loading
-10. **Attack surface scoring:** Weighted score + risk level
+10. **Service worker scanner (Phase 12o):** Registration URLs, fetch interceptors, message origin validation, cache API, skipWaiting, clients.claim
+11. **Chunk dependency graph (Phase 12p):** Webpack module extraction, dependency graph, hub/hot module detection, admin-chunk identification
+12. **Attack surface scoring:** Weighted score + risk level
 
 ## Suppression Comments
 
@@ -145,11 +178,12 @@ Notable findings on Juice Shop:
 
 ```
 tools/
-├── omega-unified.js          # Main scanner (1,907 lines)
+├── omega-unified.js          # Main scanner (2,325 lines)
 ├── js-decoder-omega.js       # v4 original (reference)
 ├── js-decoder-omega-v5.js    # v5 entry point (reference)
 ├── test-target.js            # Synthetic test input
 ├── package.json              # Module metadata
+├── js-analysis-workflow.md   # 7-phase pipeline + gap documentation
 ├── README.md
 └── lib/
     ├── ast-parser.js         # Component-counting AST parser
@@ -162,11 +196,11 @@ tools/
     ├── network-surface.js    # Network endpoint extraction
     ├── obfuscation.js        # Obfuscation decoder
     ├── sarif.js              # SARIF report generator
-    ├── sourcemap.js          # Source map parser
+    ├── sourcemap.js          # Source map parser (252 lines)
     ├── taint-ast.js          # AST taint flow analyser (625 lines)
     ├── taint-tracker.js      # Regex taint tracker (legacy)
     ├── wasm-extractor.js     # WebAssembly binary extractor
-    ├── webpack-resolver.js   # Webpack chunk resolver
+    ├── webpack-resolver.js   # Webpack chunk resolver (349 lines)
     └── worker-pool.js        # Parallel worker pool
 ```
 

@@ -58,6 +58,9 @@
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
+const os     = require('os');
+const http   = require('http');
+const https  = require('https');
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  LIB MODULES (v5 upgrades)
@@ -1680,7 +1683,7 @@ function formatTextReport(findings, metadata, clr) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  DECODE PIPELINE (wraps P0-P7)
 // ═══════════════════════════════════════════════════════════════════════════
-function decodePipeline(src) {
+function decodePipeline(src, inputPath) {
   let code = resolveModuleAliases(src, {}).src;
   code = decodeEscapes(code).src;
   code = decodeStrings(code).src;
@@ -1692,6 +1695,41 @@ function decodePipeline(src) {
   code = annotateAngularIvy(code);
   code = annotateFrameworkSymbols(code, {}).src;
   code = annotateRxJS(code);
+
+  // Sourcemap auto-follow: detect inline base64 sourcemaps and apply
+  const lines = code.split('\n');
+  const lastLine = lines[lines.length - 1].trim();
+  const smMatch = lastLine.match(/\/\/[#@]\s*sourceMappingURL\s*=\s*(.+)$/);
+  if (smMatch) {
+    const url = smMatch[1].trim();
+    if (url.startsWith('data:application/json;base64,')) {
+      try {
+        const base64 = url.split(',')[1];
+        const map = JSON.parse(Buffer.from(base64, 'base64').toString('utf8'));
+        if (map && map.mappings) {
+          let sm;
+          try { sm = require('./lib/sourcemap'); } catch (e) {}
+          if (sm) {
+            const applied = sm.applySourcemap(code, map);
+            if (applied && applied.success) {
+              code = applied.source;
+            }
+          }
+        }
+      } catch (e) {}
+    } else if (inputPath && !url.startsWith('data:')) {
+      // Try loading adjacent .map file
+      try {
+        const sm = require('./lib/sourcemap');
+        const found = sm.findSourcemap(inputPath, code);
+        if (found && found.map) {
+          const applied = sm.applySourcemap(code, found.map);
+          if (applied && applied.success) code = applied.source;
+        }
+      } catch (e) {}
+    }
+  }
+
   code = beautify(code);
   return code;
 }
@@ -1701,7 +1739,137 @@ function scanStorageKeys(src) { return auditStorageKeys(src); }
 function detectFramework(src) { return detectFrameworks(src); }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  URL FETCHER (--url mode)
+//  FILE-HASH CACHE (--cache flag)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CACHE_DIR = path.join(os.homedir(), '.cache', 'omega-unified');
+
+function hashFile(src) {
+  return crypto.createHash('md5').update(src).digest('hex');
+}
+
+function loadCache(filepath) {
+  const cachePath = path.join(CACHE_DIR, filepath.replace(/[^a-zA-Z0-9_\-]/g, '_') + '.json');
+  try {
+    if (fs.existsSync(cachePath)) {
+      const cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+      return cache;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function saveCache(filepath, data) {
+  const cachePath = path.join(CACHE_DIR, filepath.replace(/[^a-zA-Z0-9_\-]/g, '_') + '.json');
+  try {
+    if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(cachePath, JSON.stringify(data), 'utf8');
+  } catch (e) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ENDPOINT VERIFIER (--verify flag)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function verifyUrl(url, timeout = 5000) {
+  return new Promise((resolve) => {
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return resolve({ url, status: 0, reachable: false, skipped: true });
+    }
+    const mod = url.startsWith('https') ? https : http;
+    const req = mod.get(url, { timeout, headers: { 'User-Agent': 'Omega-Unified/5.0' } }, (res) => {
+      resolve({ url, status: res.statusCode, reachable: res.statusCode < 500 });
+    });
+    req.on('error', () => resolve({ url, status: 0, reachable: false }));
+    req.on('timeout', () => { req.destroy(); resolve({ url, status: 0, reachable: false }); });
+  });
+}
+
+async function verifyFindings(findings, concurrency = 5) {
+  const urls = new Map();
+  const findUrls = (obj, finding) => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const key of Object.keys(obj)) {
+      const val = obj[key];
+      if (typeof val === 'string' && (val.startsWith('http://') || val.startsWith('https://'))) {
+        if (!urls.has(val)) urls.set(val, []);
+        urls.get(val).push(finding);
+      }
+      if (typeof val === 'object') findUrls(val, finding);
+    }
+  };
+  for (const f of findings) findUrls(f, f);
+
+  const results = [];
+  const entries = Array.from(urls.entries());
+  for (let i = 0; i < entries.length; i += concurrency) {
+    const batch = entries.slice(i, i + concurrency);
+    const verifications = await Promise.all(batch.map(([url]) => verifyUrl(url)));
+    for (const v of verifications) {
+      results.push(v);
+    }
+  }
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CHUNK DEPENDENCY GRAPH (webpack resolver)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function analyseChunkGraph(src) {
+  let wp;
+  try { wp = require('./lib/webpack-resolver'); } catch (e) { return null; }
+  const result = wp.analyseWebpack(src, { verbose: false });
+  if (!result.count) return null;
+
+  const findings = [];
+  const seenAdmin = new Set();
+
+  for (const mod of result.graph) {
+    if (mod.totalCalls > 20 && !/module-\d+/.test(mod.name)) {
+      findings.push({
+        type: 'chunk-hub', severity: 'LOW', file: '',
+        value: `Hub module: ${mod.name} (${mod.totalCalls} deps)`,
+        ctx: `Module ${mod.id} in chunk ${mod.chunk}`,
+        desc: 'High-traffic module — central dependency hub, high-value target',
+      });
+    }
+    if (/admin|dashboard|panel|manage/.test(mod.name) && !seenAdmin.has(mod.id)) {
+      seenAdmin.add(mod.id);
+      findings.push({
+        type: 'chunk-admin-module', severity: 'MEDIUM', file: '',
+        value: `Admin logic in chunk ${mod.chunk}: ${mod.name}`,
+        ctx: `Module ${mod.id} — ${mod.name}`,
+        desc: 'Admin-related logic found in a webpack chunk — review access controls',
+      });
+    }
+  }
+
+  for (const hm of result.hotModules.slice(0, 10)) {
+    if (hm.incomingReferences > 50 && !/module-\d+/.test(hm.name)) {
+      findings.push({
+        type: 'chunk-hot-module', severity: 'INFO', file: '',
+        value: `Hot module: ${hm.name} (${hm.incomingReferences} refs)`,
+        ctx: `Module ${hm.id}`,
+        desc: 'Most-referenced module — compromise here affects many dependents',
+      });
+    }
+  }
+
+  if (result.format === 'webpack5' || result.format === 'webpack4') {
+    findings.push({
+      type: 'chunk-format', severity: 'INFO', file: '',
+      value: `Webpack ${result.format}: ${result.count} modules`,
+      ctx: '',
+      desc: `Detected ${result.format} bundler with ${result.count} modules`,
+    });
+  }
+
+  return { findings, modules: result.modules.length, format: result.format, hotModules: result.hotModules };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  FETCH URL HELPER (--url mode)
 // ═══════════════════════════════════════════════════════════════════════════
 
 function fetchURL(url) {
@@ -1724,9 +1892,24 @@ function fetchURL(url) {
 function scanDirectory(dirPath, options) {
   const entries = fs.readdirSync(dirPath).filter(f => f.endsWith('.js')).sort();
   if (!entries.length) throw new Error(`No .js files found in ${dirPath}`);
-  const allFindings = []; const phaseTimes = []; let totalMs = 0; let suppressedCount = 0;
+  const allFindings = []; const phaseTimes = []; let totalMs = 0; let suppressedCount = 0; let cachedCount = 0;
   for (const file of entries) {
     const fp = path.join(dirPath, file);
+    // Check cache
+    if (options.cache) {
+      const cached = loadCache(fp);
+      if (cached) {
+        const currentHash = hashFile(fs.readFileSync(fp, 'utf8'));
+        if (cached.hash === currentHash) {
+          if (options.verbose) console.log(`  ${C.dim(`[cached] ${file}`)}`);
+          cachedCount++;
+          for (const f of (cached.result?.findings || [])) {
+            if (f && typeof f === 'object') { f.file = file; allFindings.push(f); }
+          }
+          continue;
+        }
+      }
+    }
     const src = fs.readFileSync(fp, 'utf8');
     const opts = { ...options, filename: file, quiet: true };
     const result = runPipeline(src, opts);
@@ -1736,12 +1919,16 @@ function scanDirectory(dirPath, options) {
     phaseTimes.push(...result.metadata.phaseTimes.map(p => ({ ...p, file })));
     totalMs += result.metadata.totalMs;
     suppressedCount += result.suppressedCount || 0;
+    // Save to cache
+    if (options.cache) {
+      saveCache(fp, { hash: hashFile(src), timestamp: Date.now(), result: { findings: result.findings, metadata: result.metadata } });
+    }
   }
   const attackSurface = scoreAttackSurface(allFindings, null, null);
   return {
     findings: allFindings, phaseTimes, totalMs, suppressedCount,
     metadata: { filename: dirPath, size: 0, attackSurface, framework: null, totalMs, suppressedCount, filesScanned: entries.length },
-    batch: { files: entries.length, filesScanned: entries.length },
+    batch: { files: entries.length, filesScanned: entries.length, cachedCount },
   };
 }
 
@@ -1815,7 +2002,7 @@ function runPipeline(src, options = {}) {
   const results = {};
 
   // Phase 0-7: Decoding pipeline + bracket normalization
-  let decoded = phase('decode', () => decodePipeline(src));
+  let decoded = phase('decode', () => decodePipeline(src, options.filename ? path.resolve(options.filename) : null));
   // Convert obj["prop"] to obj.prop so all dot-notation regexes match minified code
   decoded = decoded.replace(/\[\s*["'](\w+)["']\s*\]/g, '.$1');
   results.decoded = decoded;
@@ -1869,6 +2056,11 @@ function runPipeline(src, options = {}) {
     results.serviceWorker = phase('service-worker', () => scanServiceWorker(decoded));
   }
 
+  // Phase 12p: Chunk dependency graph (webpack resolver)
+  if (!options.fast) {
+    results.chunkGraph = phase('chunk-graph', () => analyseChunkGraph(src));
+  }
+
   // Aggregate all findings
   const allFindings = [];
   for (const key of Object.keys(results)) {
@@ -1916,7 +2108,7 @@ function runPipeline(src, options = {}) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function parseCLI(argv) {
-  const opts = { _:[], format:'text', quiet:false, verbose:false, fast:false, dir:false, url:false };
+  const opts = { _:[], format:'text', quiet:false, verbose:false, fast:false, dir:false, url:false, cache:false, verify:false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-h' || a === '--help') { opts.help = true; continue; }
@@ -1929,6 +2121,8 @@ function parseCLI(argv) {
     if (a === '--no-routes') { opts['no-routes'] = true; continue; }
     if (a === '--dir') { opts.dir = true; opts.dirPath = argv[++i] || null; continue; }
     if (a === '--url') { opts.url = true; continue; }
+    if (a === '--cache') { opts.cache = true; continue; }
+    if (a === '--verify') { opts.verify = true; continue; }
     if (a === '-f' || a === '--format') { opts.format = argv[++i] || 'text'; continue; }
     if (a === '-o' || a === '--output') { opts.output = argv[++i] || null; continue; }
     if (a === '--config') { opts.config = argv[++i] || null; continue; }
@@ -1953,6 +2147,8 @@ Options:
   --fast                 Skip extended scanners (12b-n)
   --dir <path>           Scan all .js files in directory (batch mode)
   --url <url>            Download and scan a JS file from URL
+  --cache                Enable file-hash cache to skip unchanged files
+  --verify               Verify discovered endpoints via HTTP
   --no-color             Disable ANSI colors
   --no-frames            Disable framework detection
   --no-routes            Disable route extraction
@@ -1961,11 +2157,11 @@ Options:
   --version              Show version
 
 Examples:
-  node omega-unified.js bundle.js
-  node omega-unified.js -f json -o report.json bundle.js
-  node omega-unified.js --fast --verbose bundle.js
-  node omega-unified.js --dir ./js-files/ -f html -o batch-report.html
-  node omega-unified.js --url https://example.com/bundle.js -f github-annotation`);
+   node omega-unified.js bundle.js
+   node omega-unified.js -f json -o report.json bundle.js
+   node omega-unified.js --fast --verbose bundle.js
+   node omega-unified.js --dir ./js-files/ --cache -f html -o batch-report.html
+   node omega-unified.js --url https://example.com/bundle.js --verify -f github-annotation`);
     process.exit(0);
   }
   if (args.version) {
@@ -1975,7 +2171,7 @@ Examples:
   }
 
   async function main() {
-    let src, filename;
+    let src, filename, filepath;
 
     if (args.dir && args.dirPath) {
       // ── Directory batch mode ──
@@ -1983,11 +2179,12 @@ Examples:
       let config = null;
       if (args.config) { try { config = require('./lib/config'); } catch(e) { console.error(`Warning: ${e.message}`); } }
       const startTime = Date.now();
-      const result = scanDirectory(args.dirPath, { fast: !!args.fast, verbose: !!args.verbose, config });
+      const result = scanDirectory(args.dirPath, { fast: !!args.fast, verbose: !!args.verbose, cache: !!args.cache, config });
       const elapsed = Date.now() - startTime;
       if (!args.quiet) {
         const {score,risk}=result.metadata.attackSurface;
-        console.log(`Files: ${result.batch.files} | Findings: ${result.findings.length} | Attack Surface: ${score} [${risk}] ${C.dim(`in ${(elapsed/1000).toFixed(2)}s`)}`);
+        const cachedStr = result.batch.cachedCount ? ` | ${C.dim(`Cached: ${result.batch.cachedCount}`)}` : '';
+        console.log(`Files: ${result.batch.files} | Findings: ${result.findings.length} | Attack Surface: ${score} [${risk}]${cachedStr} ${C.dim(`in ${(elapsed/1000).toFixed(2)}s`)}`);
       }
       const format = args.format;
       let output;
@@ -2013,7 +2210,38 @@ Examples:
     } else {
       // ── File mode ──
       if (!args._ || args._.length < 1) { console.error('Error: No input file specified. Use -h for help.'); process.exit(1); }
-      const filepath = args._[0];
+      filepath = args._[0];
+      const absPath = path.resolve(filepath);
+
+      // Check cache
+      if (args.cache) {
+        const cached = loadCache(absPath);
+        if (cached) {
+          const currentHash = hashFile(fs.readFileSync(absPath, 'utf8'));
+          if (cached.hash === currentHash) {
+            if (!args.quiet) console.log(`${C.dim('Cache hit — skipping')}`);
+            if (args.verify) {
+              const verified = await verifyFindings(cached.result?.findings || []);
+              if (verified.length) console.log(`Verification: ${verified.filter(v=>v.reachable).length}/${verified.length} endpoints reachable`);
+            }
+            const cachedResult = cached.result || { findings: [], metadata: { filename: path.basename(filepath), size: 0, attackSurface: {score:0,risk:'NONE'} } };
+            const format = args.format || 'text';
+            let output;
+            switch (format) {
+              case 'json': output = generateJSONReport(cachedResult.findings, cachedResult.metadata); break;
+              case 'html': output = generateHTMLReport(cachedResult.findings, cachedResult.metadata); break;
+              case 'md': case 'markdown': output = generateMarkdownReport(cachedResult.findings, cachedResult.metadata); break;
+              case 'sarif': output = generateSARIFReport(cachedResult.findings, cachedResult.metadata); break;
+              case 'github-annotation': output = formatGitHubAnnotations(cachedResult.findings, cachedResult.metadata); break;
+              default: output = formatTextReport(cachedResult.findings, cachedResult.metadata, args['no-color'] ? null : C);
+            }
+            if (args.output) { fs.writeFileSync(args.output, output, 'utf8'); if (!args.quiet) console.log(`${C.green('Report written:')} ${args.output}`); }
+            else process.stdout.write(output);
+            return;
+          }
+        }
+      }
+
       try { src = fs.readFileSync(filepath, 'utf8'); filename = path.basename(filepath); } catch(e) { console.error(`Error reading ${filepath}: ${e.message}`); process.exit(1); }
     }
 
@@ -2040,6 +2268,24 @@ Examples:
         for (const r of result.suppressionReasons) console.log(`  ${C.dim(r)}`);
       }
     }
+
+    // Save to cache if enabled
+    if (args.cache && filepath) {
+      saveCache(path.resolve(filepath), { hash: hashFile(src), timestamp: Date.now(), result: { findings: result.findings, metadata: result.metadata } });
+    }
+
+    // Verify endpoints if --verify
+    if (args.verify && result.findings.length) {
+      if (!args.quiet) console.log(`\n${C.cyan('Verifying endpoints...')}`);
+      const verified = await verifyFindings(result.findings);
+      const reachable = verified.filter(v => v.reachable);
+      if (reachable.length && !args.quiet) {
+        console.log(`${C.yellow(`Reachable endpoints (${reachable.length}/${verified.length}):`)}`);
+        for (const v of reachable.slice(0, 10)) console.log(`  ${C.green('✓')} ${v.url} (${v.status})`);
+        if (reachable.length > 10) console.log(`  ... and ${reachable.length - 10} more`);
+      }
+    }
+
     const format = args.format || 'text';
     let output;
     switch (format) {
@@ -2070,7 +2316,8 @@ module.exports = {
   scanDynamicCodeExecution, scanBusinessLogic, scanWebSocketContent,
   scanCryptoContext, scanInfoLeakage, scanIDOR, scanDependencies,
   scanRaceConditions, scanTaintFlow, scanWeb3, scanConfigDrivenBehaviour, scanLazyLoading,
-  scanServiceWorker, scanDirectory, fetchURL, formatGitHubAnnotations,
+  scanServiceWorker, analyseChunkGraph, scanDirectory, fetchURL, formatGitHubAnnotations,
+  verifyFindings, verifyUrl, loadCache, saveCache, hashFile,
   detectFramework, extractRoutes, mapAuthSurface, scanStorageKeys, scanCodePatterns,
   scoreAttackSurface, splitWebpackModules, buildDependencyGraph,
   generateJSONReport, generateHTMLReport, generateMarkdownReport, generateSARIFReport,
