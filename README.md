@@ -1,24 +1,52 @@
-# Omega Unified Scanner
+# Ω Omega Unified Scanner
 
-Merged v4+v5 JavaScript security scanner — decodes and analyzes JS bundles for credentials, XSS, network surfaces, crypto misuse, IDOR, AST-based taint flow analysis, Web3 vulnerabilities, and more. Zero external dependencies. Achieves **273 findings** on OWASP Juice Shop 20.1.1 in 10.7s.
+**Zero-dependency JavaScript security scanner** — decodes obfuscated JS bundles and detects XSS, prototype pollution, hardcoded credentials, crypto misuse, AST-based taint flow, eval/Funcion() sinks, and 50+ vulnerability classes. Achieves **273 findings** on OWASP Juice Shop 20.1.1 in 10.7s.
 
-## Quick Start (Termux)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [CLI Usage](#cli-usage)
+- [Output Formats](#output-formats)
+- [How It Works](#how-it-works)
+- [Suppression Comments](#suppression-comments)
+- [Benchmarks](#benchmarks)
+- [File Structure](#file-structure)
+- [Requirements](#requirements)
+
+---
+
+## Features
+
+- **Zero npm dependencies** — runs on Node.js core only
+- **AST-based taint tracking** — traces untrusted data through 5+ variable hops
+- **Decode pipeline** — resolves Webpack wrappers, charCode/base64/hex obfuscation, Angular Ivy/Vue3/React/Svelte symbols, beautifies output
+- **50+ detection scanners** — XSS, prototype pollution, eval, crypto misuse, hardcoded secrets, WebSocket hijacking, command injection, IDOR, race conditions, Web3/blockchain
+- **Multiple output formats** — text, JSON, HTML, Markdown, SARIF
+- **Suppression comments** — `// omega-ignore: rule-id` for false positives
+- **Attack surface scoring** — weighted CRITICAL/HIGH/MEDIUM/LOW risk levels
+
+## Quick Start
 
 ```bash
-# 1. Prerequisites — Node.js is required
-node --version          # should be v18+
+# Ensure Node.js v18+
+node --version
 
-# 2. Create package.json (needed for lib/ module resolution)
-cd ~/tools
+# Create minimal package.json for module resolution
 cat > package.json << 'EOF'
 { "name": "omega-unified", "version": "5.0.0", "private": true, "main": "omega-unified.js" }
 EOF
 
-# 3. Run a scan
-node omega-unified.js test-target.js
+# Scan a file
+node omega-unified.js bundle.js
 
-# Full scan with report
-node omega-unified.js -f html -o scan-report.html js-decoder-omega.js
+# Generate HTML report
+node omega-unified.js -f html -o report.html bundle.js
 ```
 
 ## CLI Usage
@@ -41,48 +69,50 @@ Options:
 ### Examples
 
 ```bash
-# Quick scan, default text output
+# Quick scan
 node omega-unified.js bundle.js
 
-# Full scan with JSON report
+# JSON report for programmatic parsing
 node omega-unified.js -f json -o report.json bundle.js
 
-# Scan without extended scanners (faster)
+# Fast scan (skip extended scanners)
 node omega-unified.js --fast bundle.js
 
-# SARIF output for CI integration
+# CI/CD integration with SARIF
 node omega-unified.js -f sarif -o results.sarif bundle.js
 
-# HTML report with verbose phase info
+# Verbose HTML report with phase timings
 node omega-unified.js -f html -o scan.html --verbose bundle.js
 ```
 
 ## Output Formats
 
-| Format    | Extension  | Use Case              |
-|-----------|------------|-----------------------|
-| `text`    | stdout     | Terminal review       |
-| `json`    | `.json`    | Programmatic parsing  |
-| `html`    | `.html`    | Visual report         |
-| `md`      | `.md`      | GitHub/GitLab notes   |
-| `sarif`   | `.sarif`   | CI/CD pipeline ingest |
+| Format  | Extension | Use Case              |
+|---------|-----------|-----------------------|
+| `text`  | stdout    | Terminal review       |
+| `json`  | `.json`   | Programmatic parsing  |
+| `html`  | `.html`   | Visual report         |
+| `md`    | `.md`     | GitHub/GitLab notes   |
+| `sarif` | `.sarif`  | CI/CD pipeline ingest |
 
 ## How It Works
 
-1. **Decode pipeline** (Phases 0-7): resolves module aliases, unescapes strings, decodes charCode/base64/hex obfuscation, normalizes booleans, strips Webpack wrappers, annotates Angular Ivy / Vue3 / React / Svelte / Lodash / RxJS symbols, beautifies output
-2. **Code analysis** (Phase 8): counts functions/classes/components/services, measures cyclomatic complexity, identifies route guards, socket events
-3. **Storage audit** (Phase 8b): catalogs localStorage/sessionStorage/cookie keys, flags sensitive names
-4. **Auth surface mapping** (Phase 8c): finds protected vs unprotected endpoints
-5. **Framework detection** (Phase 9): identifies Angular/Vue/React/Svelte/Next.js/Webpack/Vite
-6. **Route extraction** (Phase 10): parses Angular/Vue/React route definitions
-7. **Credential scanner** (Phase 11): 32 patterns — API keys, JWTs, AWS, Google OAuth, Stripe, tokens
-8. **Security analysis** (Phase 12): XSS sinks, eval/Function(), Angular `bypassSecurityTrust*`, command injection, broken crypto, JWT secrets, window.open
-9. **Extended scanners** (Phase 12b-n, skip with `--fast`): dynamic code exec, business logic flaws, WebSocket XSS, crypto context, info leakage, IDOR, vulnerable dependencies, race conditions, **AST-based taint flow** (propagation through 5+ variable hops), Web3/blockchain, config-driven behaviour, lazy loading
-10. **Attack surface scoring**: weighted score + risk level (CRITICAL/HIGH/MEDIUM/LOW)
+The scanner processes JS files through 15 phases:
+
+1. **Decode pipeline (Phases 0–7):** Resolves module aliases, unescapes strings, decodes charCode/base64/hex obfuscation, normalizes booleans, strips Webpack wrappers, annotates Angular Ivy / Vue3 / React / Svelte / Lodash / RxJS symbols, beautifies output
+2. **Code analysis (Phase 8):** Counts functions/classes/components/services, measures cyclomatic complexity, identifies route guards, socket events
+3. **Storage audit (Phase 8b):** Catalogs localStorage/sessionStorage/cookie keys, flags sensitive names
+4. **Auth surface mapping (Phase 8c):** Finds protected vs unprotected endpoints
+5. **Framework detection (Phase 9):** Identifies Angular/Vue/React/Svelte/Next.js/Webpack/Vite
+6. **Route extraction (Phase 10):** Parses Angular/Vue/React route definitions
+7. **Credential scanner (Phase 11):** 32 patterns — API keys, JWTs, AWS, Google OAuth, Stripe, tokens
+8. **Security analysis (Phase 12):** XSS sinks, eval/Funcion(), Angular `bypassSecurityTrust*`, command injection, broken crypto, JWT secrets, window.open
+9. **Extended scanners (Phases 12b–n, skip with `--fast`):** Dynamic code exec, business logic flaws, WebSocket XSS, crypto context, info leakage, IDOR, vulnerable dependencies, race conditions, **AST-based taint flow** (propagation through 5+ variable hops), Web3/blockchain, config-driven behavior, lazy loading
+10. **Attack surface scoring:** Weighted score + risk level
 
 ## Suppression Comments
 
-Suppress false positives by adding comments to the scanned file:
+Suppress false positives by annotating the scanned file:
 
 ```js
 // omega-ignore: xss-eval this is analyzed server-side
@@ -91,88 +121,57 @@ Suppress false positives by adding comments to the scanned file:
 // omega-ignore-next-line: crypto-broken-entropy
 ```
 
-## Upload to GitHub
+## Benchmarks
 
-```bash
-cd ~/tools
+| Target | Size | Findings | Attack Surface | Time |
+|--------|------|----------|---------------|------|
+| Juice Shop 20.1.1 `main.js` | 766 KB | **273** (11 Critical) | 677 [CRITICAL] | 10.7s |
+| Juice Shop 20.1.1 (all chunks) | 4.7 MB | ~290 total | — | ~30s |
+| `test-target.js` (synthetic) | 1.4 KB | 10 | 47 [HIGH] | 0.7s |
 
-# Create package.json (if you haven't already)
-cat > package.json << 'EOF'
-{ "name": "omega-unified", "version": "5.0.0", "private": true, "main": "omega-unified.js" }
-EOF
+Notable findings on Juice Shop:
 
-# Create .gitignore
-cat > .gitignore << 'EOF'
-node_modules/
-report.*.json
-omega_output/
-*.log
-EOF
-
-git init
-git add -A
-git commit -m "Initial: omega-unified v5 — merged JS security scanner"
-
-# Create repo and push (requires GitHub CLI)
-gh repo create omega-unified --public --push --source=.
-```
-
-To push to an existing repo instead:
-
-```bash
-git remote add origin https://github.com/YOUR_USER/omega-unified.git
-git branch -M main
-git push -u origin main
-```
+| Class | Example |
+|-------|---------|
+| Hardcoded credentials | `IamUsedForTesting` |
+| OAuth key exposure | Google OAuth client ID |
+| Coupon codes | `WMNSDY2019`–`WMNSDY2023` |
+| Angular XSS bypass | `bypassSecurityTrustHtml` |
+| Prototype pollution | Multiple sinks detected |
+| Unguarded admin routes | 12 unprotected endpoints |
+| Taint flows (AST) | 43 flows, 160 variables tracked |
 
 ## File Structure
 
 ```
 tools/
-├── omega-unified.js        # Main merged script (1,880 lines)
-├── js-decoder-omega.js      # v4 original (reference)
-├── js-decoder-omega-v5.js   # v5 entry point (reference)
-├── test-target.js           # Small test input
-├── package.json             # Module metadata
-├── README.md                # This file
+├── omega-unified.js          # Main scanner (1,907 lines)
+├── js-decoder-omega.js       # v4 original (reference)
+├── js-decoder-omega-v5.js    # v5 entry point (reference)
+├── test-target.js            # Synthetic test input
+├── package.json              # Module metadata
+├── README.md
 └── lib/
-    ├── ast-parser.js
-    ├── call-chain.js
+    ├── ast-parser.js         # Component-counting AST parser
+    ├── call-chain.js         # Call chain analyser
     ├── config.js             # Suppression comment parser
-    ├── crypto-patterns.js
-    ├── esm-detector.js
-    ├── framework-inference.js
-    ├── import-graph.js
-    ├── network-surface.js
-    ├── obfuscation.js
-    ├── sarif.js
-    ├── sourcemap.js
-    ├── taint-ast.js           # AST-based taint flow analyzer (541 lines)
-    ├── taint-tracker.js
-    ├── wasm-extractor.js
-    ├── webpack-resolver.js
-    └── worker-pool.js
+    ├── crypto-patterns.js    # Crypto misuse detectors
+    ├── esm-detector.js       # ESM module analyser
+    ├── framework-inference.js# Framework detection
+    ├── import-graph.js       # Import dependency graph
+    ├── network-surface.js    # Network endpoint extraction
+    ├── obfuscation.js        # Obfuscation decoder
+    ├── sarif.js              # SARIF report generator
+    ├── sourcemap.js          # Source map parser
+    ├── taint-ast.js          # AST taint flow analyser (625 lines)
+    ├── taint-tracker.js      # Regex taint tracker (legacy)
+    ├── wasm-extractor.js     # WebAssembly binary extractor
+    ├── webpack-resolver.js   # Webpack chunk resolver
+    └── worker-pool.js        # Parallel worker pool
 ```
-
-## Real-World Benchmarks
-
-| Target | Size | Findings | Attack Surface | Time |
-|--------|------|----------|---------------|------|
-| OWASP Juice Shop 20.1.1 `main.js` | 766 KB | **273** (11 Critical) | 677 [CRITICAL] | 10.7s |
-| OWASP Juice Shop 20.1.1 (all chunks) | 4.7 MB | ~290 total | — | ~30s |
-| `test-target.js` (synthetic) | 1.4 KB | 8 | 27 [MEDIUM] | 0.5s |
-
-Notable findings on Juice Shop:
-- Hardcoded credentials (`IamUsedForTesting`)
-- Google OAuth client ID
-- 5 coupon codes (`WMNSDY2019`-`2023`)
-- `bypassSecurityTrustHtml` (Angular XSS bypass)
-- Prototype pollution sinks
-- 12 unguarded admin routes
-- 43 taint flows (AST-detected, 160 tainted variables tracked)
 
 ## Requirements
 
-- Node.js v18+ (v20+ recommended)
-- Termux on Android or any Linux/macOS/Windows environment
-- No npm dependencies — zero external packages
+- **Node.js** v18+ (v20+ recommended)
+- **Platforms:** Termux (Android), Linux, macOS, Windows
+- **Dependencies:** Zero — no npm packages required
