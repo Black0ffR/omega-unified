@@ -1472,13 +1472,17 @@ function scoreAttackSurface(allFindings, authSurface, routes) {
   const weights = { critical:10, high:5, medium:2, low:1, info:0 };
   let score = 0; const breakdown = {};
   for (const f of allFindings) { const sev=f.severity||f.sev||'info'; const cat=f.category||f.name||'Unknown'; const w=weights[sev]||0; score+=w; breakdown[cat]=(breakdown[cat]||0)+w; }
-  score += (authSurface.unguardedRoutes||[]).length * 8;
-  if ((authSurface.unguardedRoutes||[]).length) breakdown['Unguarded Routes'] = authSurface.unguardedRoutes.length * 8;
-  score += (authSurface.unprotectedEndpoints||[]).length * 6;
-  if ((authSurface.unprotectedEndpoints||[]).length) breakdown['Unprotected Endpoints'] = authSurface.unprotectedEndpoints.length * 6;
-  const hiddenRoutes = routes.filter(r=>r.type&&r.type.startsWith('Hidden'));
-  score += hiddenRoutes.length * 4;
-  if (hiddenRoutes.length) breakdown['Hidden Routes'] = hiddenRoutes.length * 4;
+  if (authSurface) {
+    score += (authSurface.unguardedRoutes||[]).length * 8;
+    if ((authSurface.unguardedRoutes||[]).length) breakdown['Unguarded Routes'] = authSurface.unguardedRoutes.length * 8;
+    score += (authSurface.unprotectedEndpoints||[]).length * 6;
+    if ((authSurface.unprotectedEndpoints||[]).length) breakdown['Unprotected Endpoints'] = authSurface.unprotectedEndpoints.length * 6;
+  }
+  if (routes) {
+    const hiddenRoutes = routes.filter(r=>r.type&&r.type.startsWith('Hidden'));
+    score += hiddenRoutes.length * 4;
+    if (hiddenRoutes.length) breakdown['Hidden Routes'] = hiddenRoutes.length * 4;
+  }
   const risk = score>=80?'CRITICAL':score>=40?'HIGH':score>=15?'MEDIUM':'LOW';
   const topCategories = Object.entries(breakdown).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([cat,pts])=>`${cat} (${pts}pts)`);
   return { score, risk, breakdown, topCategories };
@@ -1697,6 +1701,111 @@ function scanStorageKeys(src) { return auditStorageKeys(src); }
 function detectFramework(src) { return detectFrameworks(src); }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  URL FETCHER (--url mode)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function fetchURL(url) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? require('https') : require('http');
+    mod.get(url, { timeout: 30000, headers: { 'User-Agent': 'Omega-Unified/5.0' } }, (res) => {
+      if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      if (res.statusCode >= 300 && res.headers.location) return fetchURL(res.headers.location);
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    }).on('error', reject).on('timeout', function() { this.destroy(); reject(new Error('Timeout')); });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  DIRECTORY SCANNER (--dir mode)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function scanDirectory(dirPath, options) {
+  const entries = fs.readdirSync(dirPath).filter(f => f.endsWith('.js')).sort();
+  if (!entries.length) throw new Error(`No .js files found in ${dirPath}`);
+  const allFindings = []; const phaseTimes = []; let totalMs = 0; let suppressedCount = 0;
+  for (const file of entries) {
+    const fp = path.join(dirPath, file);
+    const src = fs.readFileSync(fp, 'utf8');
+    const opts = { ...options, filename: file, quiet: true };
+    const result = runPipeline(src, opts);
+    for (const f of result.findings) {
+      if (f && typeof f === 'object') { f.file = file; allFindings.push(f); }
+    }
+    phaseTimes.push(...result.metadata.phaseTimes.map(p => ({ ...p, file })));
+    totalMs += result.metadata.totalMs;
+    suppressedCount += result.suppressedCount || 0;
+  }
+  const attackSurface = scoreAttackSurface(allFindings, null, null);
+  return {
+    findings: allFindings, phaseTimes, totalMs, suppressedCount,
+    metadata: { filename: dirPath, size: 0, attackSurface, framework: null, totalMs, suppressedCount, filesScanned: entries.length },
+    batch: { files: entries.length, filesScanned: entries.length },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SERVICE WORKER SCANNER (Phase 12o)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function scanServiceWorker(src) {
+  const findings = [];
+  if (!/serviceWorker|self\.addEventListener|caches\.open|skipWaiting|clients\.claim/.test(src)) return findings;
+
+  const swReg = src.match(/navigator\s*\.\s*serviceWorker\s*\.\s*register\s*\(\s*["']([^"']+)["']/g);
+  if (swReg) {
+    for (const m of swReg) {
+      const url = m.match(/["']([^"']+)["']/)[1];
+      if (!url.startsWith('/') && !url.startsWith('./') && !url.startsWith(self?.location?.origin)) {
+        findings.push({ type:'sw-register-relative', severity:'MEDIUM', value:`SW register: ${url}`, ctx:m.substring(0,120), desc:'Service worker with relative URL — scope hijacking risk' });
+      }
+    }
+  }
+
+  if (/addEventListener\s*\(\s*["']fetch["']/.test(src)) {
+    const ms = src.match(/addEventListener\s*\(\s*["']fetch["'][^)]*\)/g);
+    if (ms) for (const m of ms) {
+      findings.push({ type:'sw-fetch-intercept', severity:'MEDIUM', value:'SW fetch listener', ctx:m.substring(0,120), desc:'SW intercepts all fetch requests — can modify responses, inject content, exfiltrate data' });
+    }
+  }
+
+  if (/addEventListener\s*\(\s*["']message["']/.test(src)) {
+    const ms = src.match(/addEventListener\s*\(\s*["']message["'][^)]*\)/g);
+    if (ms) for (const m of ms) {
+      const hasOriginCheck = /(origin|source)\s*===?\s*/.test(m);
+      findings.push({ type: hasOriginCheck ? 'sw-message' : 'sw-message-no-origin', severity: hasOriginCheck ? 'INFO' : 'HIGH',
+        value: hasOriginCheck ? 'SW message (origin-checked)' : 'SW message (NO origin check)',
+        ctx: m.substring(0,120),
+        desc: hasOriginCheck ? 'SW postMessage communication' : 'SW message listener without origin validation' });
+    }
+  }
+
+  const cacheOpen = src.match(/caches\s*\.\s*open\s*\(/g);
+  if (cacheOpen) findings.push({ type:'sw-cache-api', severity:'INFO', value:`Cache API: ${cacheOpen.length} call(s)`, ctx:`caches.open() used ${cacheOpen.length} times`, desc:'SW uses Cache API — verify cache keys are not attacker-controllable' });
+
+  if (/skipWaiting\s*\(/.test(src)) findings.push({ type:'sw-skip-waiting', severity:'INFO', value:'skipWaiting()', desc:'SW calls skipWaiting() — immediate activation, version rollback risk' });
+  if (/clients\s*\.\s*claim\s*\(/.test(src)) findings.push({ type:'sw-clients-claim', severity:'INFO', value:'clients.claim()', desc:'SW calls clients.claim() — takes control of all clients immediately' });
+
+  return findings;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  GITHUB ANNOTATIONS FORMATTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+function formatGitHubAnnotations(findings, metadata) {
+  const emap = { CRITICAL:'error', HIGH:'error', MEDIUM:'warning', LOW:'warning', INFO:'notice' };
+  return findings.map(f => {
+    const sev = emap[f.severity] || 'warning';
+    const file = f.file || metadata.filename || 'input.js';
+    const title = (f.type || 'finding').replace(/"/g, '\\"');
+    const msg = (f.value || f.desc || 'no details').replace(/"/g, '\\"').replace(/\n/g, ' ');
+    return `::${sev} file=${file},title=${title}::${msg}`;
+  }).join('\n') + '\n';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  MAIN PIPELINE ORCHESTRATOR
 // ═══════════════════════════════════════════════════════════════════════════
 function runPipeline(src, options = {}) {
@@ -1752,15 +1861,23 @@ function runPipeline(src, options = {}) {
     results.taintFlow = phase('taint-flow', () => scanTaintFlow(decoded));
     results.web3 = phase('web3', () => scanWeb3(decoded));
     results.configBehaviour = phase('config-behaviour', () => scanConfigDrivenBehaviour(decoded));
-    results.lazyLoading = phase('lazy-loading', () => scanLazyLoading(decoded));
+  results.lazyLoading = phase('lazy-loading', () => scanLazyLoading(decoded));
+  }
+
+  // Phase 12o: Service worker analysis
+  if (!options.fast) {
+    results.serviceWorker = phase('service-worker', () => scanServiceWorker(decoded));
   }
 
   // Aggregate all findings
   const allFindings = [];
   for (const key of Object.keys(results)) {
-    if (Array.isArray(results[key])) allFindings.push(...results[key]);
-    else if (results[key] && Array.isArray(results[key].findings)) allFindings.push(...results[key].findings);
-    else if (results[key] && results[key].findings && Array.isArray(results[key].findings)) allFindings.push(...results[key].findings);
+    const v = results[key];
+    if (Array.isArray(v)) {
+      for (const item of v) { if (item && typeof item === 'object') allFindings.push(item); }
+    } else if (v && v.findings && Array.isArray(v.findings)) {
+      for (const item of v.findings) { if (item && typeof item === 'object') allFindings.push(item); }
+    }
   }
 
   // Attack surface scoring
@@ -1799,7 +1916,7 @@ function runPipeline(src, options = {}) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function parseCLI(argv) {
-  const opts = { _:[], format:'text', quiet:false, verbose:false, fast:false };
+  const opts = { _:[], format:'text', quiet:false, verbose:false, fast:false, dir:false, url:false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-h' || a === '--help') { opts.help = true; continue; }
@@ -1810,6 +1927,8 @@ function parseCLI(argv) {
     if (a === '--no-color') { opts['no-color'] = true; continue; }
     if (a === '--no-frames') { opts['no-frames'] = true; continue; }
     if (a === '--no-routes') { opts['no-routes'] = true; continue; }
+    if (a === '--dir') { opts.dir = true; opts.dirPath = argv[++i] || null; continue; }
+    if (a === '--url') { opts.url = true; continue; }
     if (a === '-f' || a === '--format') { opts.format = argv[++i] || 'text'; continue; }
     if (a === '-o' || a === '--output') { opts.output = argv[++i] || null; continue; }
     if (a === '--config') { opts.config = argv[++i] || null; continue; }
@@ -1824,14 +1943,16 @@ if (require.main === module) {
     const pkg = require('./package.json');
     console.log(`Omega Unified Scanner v${pkg.version||'4.0+v5.0'}
 
-Usage: node omega-unified.js [options] <file>
+Usage: node omega-unified.js [options] <file.js | --dir <path> | --url <url>]
 
 Options:
-  -f, --format <type>    Report format: text|json|html|md|sarif (default: text)
+  -f, --format <type>    Report format: text|json|html|md|sarif|github-annotation (default: text)
   -o, --output <file>    Write output to file (optional)
   -q, --quiet            Suppress progress output
   -v, --verbose          Show detailed scan progress
   --fast                 Skip extended scanners (12b-n)
+  --dir <path>           Scan all .js files in directory (batch mode)
+  --url <url>            Download and scan a JS file from URL
   --no-color             Disable ANSI colors
   --no-frames            Disable framework detection
   --no-routes            Disable route extraction
@@ -1842,7 +1963,9 @@ Options:
 Examples:
   node omega-unified.js bundle.js
   node omega-unified.js -f json -o report.json bundle.js
-  node omega-unified.js --fast --verbose bundle.js`);
+  node omega-unified.js --fast --verbose bundle.js
+  node omega-unified.js --dir ./js-files/ -f html -o batch-report.html
+  node omega-unified.js --url https://example.com/bundle.js -f github-annotation`);
     process.exit(0);
   }
   if (args.version) {
@@ -1850,51 +1973,92 @@ Examples:
     catch(e) { console.log('4.0+v5.0'); }
     process.exit(0);
   }
-  if (!args._ || args._.length < 1) { console.error('Error: No input file specified. Use -h for help.'); process.exit(1); }
-  const filepath = args._[0];
-  let src; try { src = require('fs').readFileSync(filepath, 'utf8'); } catch(e) { console.error(`Error reading ${filepath}: ${e.message}`); process.exit(1); }
-  const useColors = args['no-color'] ? { reset:s=>s, cyan:s=>s, green:s=>s, yellow:s=>s, red:s=>s, magenta:s=>s, dim:s=>s, bold:s=>s } : C;
-  if (!args.quiet) { const sizeK=(src.length/1024).toFixed(1); console.log(`${useColors.cyan('Ω Omega Unified Scanner')} — ${useColors.dim(`${src.length} bytes (${sizeK}KB)`)}`); }
-  const startTime = Date.now();
-  let config = null;
-  if (args.config) {
-    try { config = require('./lib/config'); } catch(e) { console.error(`Warning: Could not load config module: ${e.message}`); }
-  }
-  const pipelineOpts = { fast: !!args.fast, verbose: !!args.verbose, filename: require('path').basename(filepath), config };
-  const result = runPipeline(src, pipelineOpts);
-  const elapsed = Date.now() - startTime;
-  if (!args.quiet) {
-    const {score,risk}=result.metadata.attackSurface;
-    const riskColor = risk==='CRITICAL'?useColors.red:risk==='HIGH'?useColors.yellow:risk==='MEDIUM'?useColors.magenta:useColors.green;
-    console.log(`${useColors.bold('Findings:')} ${result.findings.length} | ${useColors.bold('Attack Surface:')} ${riskColor(`${score} [${risk}]`)} ${useColors.dim(`in ${(elapsed/1000).toFixed(2)}s`)}`);
-  }
-  if (result.suppressedCount > 0 && !args.quiet) {
-    console.log(`${useColors.yellow('Suppressed:')} ${result.suppressedCount} finding(s) via suppression comments`);
-  }
-  if (args.verbose && !args.quiet) {
-    console.log(`\n${useColors.dim('Phase Times:')}`);
-    for (const pt of result.metadata.phaseTimes) console.log(`  ${useColors.dim(pt.name.padEnd(20)+String(pt.ms).padStart(6)+'ms')}`);
-    if (result.suppressionReasons && result.suppressionReasons.length) {
-      console.log(`\n${useColors.dim('Suppression Reasons:')}`);
-      for (const r of result.suppressionReasons) console.log(`  ${useColors.dim(r)}`);
+
+  async function main() {
+    let src, filename;
+
+    if (args.dir && args.dirPath) {
+      // ── Directory batch mode ──
+      if (!args.quiet) console.log(`${C.cyan('Ω Omega Unified Scanner')} — batch scanning ${args.dirPath}`);
+      let config = null;
+      if (args.config) { try { config = require('./lib/config'); } catch(e) { console.error(`Warning: ${e.message}`); } }
+      const startTime = Date.now();
+      const result = scanDirectory(args.dirPath, { fast: !!args.fast, verbose: !!args.verbose, config });
+      const elapsed = Date.now() - startTime;
+      if (!args.quiet) {
+        const {score,risk}=result.metadata.attackSurface;
+        console.log(`Files: ${result.batch.files} | Findings: ${result.findings.length} | Attack Surface: ${score} [${risk}] ${C.dim(`in ${(elapsed/1000).toFixed(2)}s`)}`);
+      }
+      const format = args.format;
+      let output;
+      switch (format) {
+        case 'json': output = JSON.stringify({ findings: result.findings, metadata: result.metadata, batch: result.batch }, null, 2); break;
+        case 'github-annotation': output = formatGitHubAnnotations(result.findings, result.metadata); break;
+        default: output = formatTextReport(result.findings, result.metadata, args['no-color'] ? null : C);
+      }
+      if (args.output) { fs.writeFileSync(args.output, output, 'utf8'); if (!args.quiet) console.log(`${C.green('Report written:')} ${args.output}`); }
+      else process.stdout.write(output);
+      return;
+    }
+
+    if (args.url) {
+      // ── URL fetch mode ──
+      const url = args._[0] || null;
+      if (!url) { console.error('Error: --url requires a URL as argument. Use -h for help.'); process.exit(1); }
+      if (!args.quiet) console.log(`${C.cyan('Ω Omega Unified Scanner')} — fetching ${C.dim(url)}`);
+      try {
+        src = await fetchURL(url);
+        filename = url.split('/').pop() || 'remote.js';
+      } catch(e) { console.error(`Error fetching ${url}: ${e.message}`); process.exit(1); }
+    } else {
+      // ── File mode ──
+      if (!args._ || args._.length < 1) { console.error('Error: No input file specified. Use -h for help.'); process.exit(1); }
+      const filepath = args._[0];
+      try { src = fs.readFileSync(filepath, 'utf8'); filename = path.basename(filepath); } catch(e) { console.error(`Error reading ${filepath}: ${e.message}`); process.exit(1); }
+    }
+
+    if (!args.quiet) { const sizeK=(src.length/1024).toFixed(1); console.log(`${C.cyan('Ω Omega Unified Scanner')} — ${C.dim(`${src.length} bytes (${sizeK}KB)`)}`); }
+    const startTime = Date.now();
+    let config = null;
+    if (args.config) { try { config = require('./lib/config'); } catch(e) { console.error(`Warning: Could not load config module: ${e.message}`); } }
+    const pipelineOpts = { fast: !!args.fast, verbose: !!args.verbose, filename: filename || 'input.js', config };
+    const result = runPipeline(src, pipelineOpts);
+    const elapsed = Date.now() - startTime;
+    if (!args.quiet) {
+      const {score,risk}=result.metadata.attackSurface;
+      const riskColor = risk==='CRITICAL'?C.red:risk==='HIGH'?C.yellow:risk==='MEDIUM'?C.magenta:C.green;
+      console.log(`${C.bold('Findings:')} ${result.findings.length} | ${C.bold('Attack Surface:')} ${riskColor(`${score} [${risk}]`)} ${C.dim(`in ${(elapsed/1000).toFixed(2)}s`)}`);
+    }
+    if (result.suppressedCount > 0 && !args.quiet) {
+      console.log(`${C.yellow('Suppressed:')} ${result.suppressedCount} finding(s) via suppression comments`);
+    }
+    if (args.verbose && !args.quiet) {
+      console.log(`\n${C.dim('Phase Times:')}`);
+      for (const pt of result.metadata.phaseTimes) console.log(`  ${C.dim(pt.name.padEnd(20)+String(pt.ms).padStart(6)+'ms')}`);
+      if (result.suppressionReasons && result.suppressionReasons.length) {
+        console.log(`\n${C.dim('Suppression Reasons:')}`);
+        for (const r of result.suppressionReasons) console.log(`  ${C.dim(r)}`);
+      }
+    }
+    const format = args.format || 'text';
+    let output;
+    switch (format) {
+      case 'json': output = generateJSONReport(result.findings, result.metadata); break;
+      case 'html': output = generateHTMLReport(result.findings, result.metadata); break;
+      case 'md': case 'markdown': output = generateMarkdownReport(result.findings, result.metadata); break;
+      case 'sarif': output = generateSARIFReport(result.findings, result.metadata); break;
+      case 'github-annotation': output = formatGitHubAnnotations(result.findings, result.metadata); break;
+      default: output = formatTextReport(result.findings, result.metadata, args['no-color'] ? null : C);
+    }
+    if (args.output) {
+      fs.writeFileSync(args.output, output, 'utf8');
+      if (!args.quiet) console.log(`${C.green('Report written:')} ${args.output}`);
+    } else {
+      process.stdout.write(output);
     }
   }
-  const format = args.format || args.f || 'text';
-  let output;
-  switch (format) {
-    case 'json': output = generateJSONReport(result.findings, result.metadata); break;
-    case 'html': output = generateHTMLReport(result.findings, result.metadata); break;
-    case 'md': case 'markdown': output = generateMarkdownReport(result.findings, result.metadata); break;
-    case 'sarif': output = generateSARIFReport(result.findings, result.metadata); break;
-    default:
-      output = formatTextReport(result.findings, result.metadata, useColors);
-  }
-  if (args.output || args.o) {
-    require('fs').writeFileSync(args.output||args.o, output, 'utf8');
-    if (!args.quiet) console.log(`${useColors.green('Report written:')} ${args.output||args.o}`);
-  } else {
-    process.stdout.write(output);
-  }
+
+  main().catch(e => { console.error(`Error: ${e.message}`); process.exit(1); });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1906,6 +2070,7 @@ module.exports = {
   scanDynamicCodeExecution, scanBusinessLogic, scanWebSocketContent,
   scanCryptoContext, scanInfoLeakage, scanIDOR, scanDependencies,
   scanRaceConditions, scanTaintFlow, scanWeb3, scanConfigDrivenBehaviour, scanLazyLoading,
+  scanServiceWorker, scanDirectory, fetchURL, formatGitHubAnnotations,
   detectFramework, extractRoutes, mapAuthSurface, scanStorageKeys, scanCodePatterns,
   scoreAttackSurface, splitWebpackModules, buildDependencyGraph,
   generateJSONReport, generateHTMLReport, generateMarkdownReport, generateSARIFReport,
